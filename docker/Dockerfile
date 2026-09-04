@@ -133,8 +133,10 @@ ENV CUDA_HOME=/usr/local/cuda \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 
-# Three separate caches, three separate env vars. All under one volume so a
-# --rm run doesn't throw away 9 GB of weights and the compiled extension.
+# Three caches, three env vars, all under one volume so a --rm run keeps the
+# u2net weights and the compiled extension. Note this does NOT cover the
+# zero123plus / InstantMesh weights: app.py hardcodes cache_dir='./ckpts/',
+# which overrides HF_HOME and puts them in /workspace/instantmesh/ckpts.
 ENV HF_HOME=/workspace/models/huggingface \
     U2NET_HOME=/workspace/models/u2net \
     TORCH_EXTENSIONS_DIR=/workspace/models/torch_extensions
@@ -143,6 +145,11 @@ VOLUME /workspace/models
 COPY --from=builder /workspace/miniconda3/envs/instantmesh /workspace/miniconda3/envs/instantmesh
 
 WORKDIR /workspace/instantmesh
+
+# Pre-baked weight. app.py:97 passes an explicit cache_dir that overrides
+# HF_HOME, so this must land in ckpts/ -- which is deliberately NOT under
+# the VOLUME above, or the build layer would be discarded.
+RUN python -c "from huggingface_hub import hf_hub_download; hf_hub_download('TencentARC/InstantMesh', 'diffusion_pytorch_model.bin', repo_type='model', cache_dir='/workspace/instantmesh/ckpts')"
 
 # App code last: editing it doesn't invalidate the env layer above.
 COPY . /workspace/instantmesh
