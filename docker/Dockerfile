@@ -1,7 +1,21 @@
+# =====================================================================
+# InstantMesh (TencentARC) — multi-stage build
+#
+# Stage 1 builds the conda env on a CUDA *devel* base.
+# Stage 2 runs it on a *runtime* base + the minimum toolchain that
+# nvdiffrast needs, because nvdiffrast compiles JIT on first use.
+#
+# Build:  docker build -t instantmesh:latest .
+# Run:    docker run --rm --gpus all -p 43839:43839 \
+#             -v $PWD/models:/workspace/models instantmesh:latest
+# =====================================================================
+
+
 # ---------- Stage 1: build ----------
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         tzdata build-essential git wget ca-certificates && \
@@ -138,7 +152,11 @@ COPY . /workspace/instantmesh
 # so if this passes, nvdiffrast will compile.
 RUN python -c "\
 from torch.utils.cpp_extension import load_inline; \
-load_inline(name='probe', cpp_sources='', cuda_sources='__global__ void k(){}'); \
+m = load_inline(name='probe', \
+    cpp_sources='int probe_fn() { return 42; }', \
+    cuda_sources='__global__ void k(){}', \
+    functions=['probe_fn']); \
+assert m.probe_fn() == 42; \
 print('CUDA toolchain OK')" && \
     rm -rf /workspace/models/torch_extensions/probe
 
