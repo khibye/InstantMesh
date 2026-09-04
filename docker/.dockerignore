@@ -1,0 +1,17 @@
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+ckpts/
+models/
+outputs/
+*.ckpt
+*.bin
+*.safetensors
+*.obj
+*.glb
+*.ply
+.venv/
+venv/
+Dockerfile
+.dockerignore
