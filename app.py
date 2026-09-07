@@ -1,8 +1,15 @@
 import os
+import json
+import logging
+import sys
+from logging.handlers import RotatingFileHandler
+from functools import wraps
+from uuid import uuid4
 import imageio
 import numpy as np
 import torch
 import rembg
+import gradio as gr
 from PIL import Image
 from torchvision.transforms import v2
 from pytorch_lightning import seed_everything
@@ -22,6 +29,103 @@ from src.utils.infer_util import remove_background, resize_foreground, images_to
 
 import tempfile
 from huggingface_hub import hf_hub_download
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        payload = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for field in ("event", "operation_id", "stage"):
+            value = getattr(record, field, None)
+            if value is not None:
+                payload[field] = value
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
+
+
+def configure_logging():
+    log_path = os.environ.get("INSTANTMESH_LOG_FILE", "logs/instantmesh.log")
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    formatter = JsonFormatter()
+    file_handler = RotatingFileHandler(
+        log_path, maxBytes=10 * 1024 * 1024, backupCount=3
+    )
+    stream_handler = logging.StreamHandler()
+    file_handler.setFormatter(formatter)
+    stream_handler.setFormatter(formatter)
+
+    app_logger = logging.getLogger("instantmesh")
+    app_logger.setLevel(logging.INFO)
+    app_logger.handlers.clear()
+    app_logger.addHandler(file_handler)
+    app_logger.addHandler(stream_handler)
+    app_logger.propagate = False
+    return app_logger
+
+
+logger = configure_logging()
+
+
+def log_uncaught_exception(exception_type, exception, traceback):
+    if issubclass(exception_type, KeyboardInterrupt):
+        sys.__excepthook__(exception_type, exception, traceback)
+        return
+    logger.critical(
+        "Uncaught application exception",
+        exc_info=(exception_type, exception, traceback),
+        extra={"event": "uncaught_exception", "stage": "application"},
+    )
+
+
+sys.excepthook = log_uncaught_exception
+
+
+def log_inference_stage(stage):
+    def decorator(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            operation_id = uuid4().hex[:12]
+            logger.info(
+                "Inference stage started",
+                extra={
+                    "event": "inference_stage_started",
+                    "operation_id": operation_id,
+                    "stage": stage,
+                },
+            )
+            try:
+                result = function(*args, **kwargs)
+            except Exception as error:
+                logger.exception(
+                    "Inference stage failed",
+                    extra={
+                        "event": "inference_stage_failed",
+                        "operation_id": operation_id,
+                        "stage": stage,
+                    },
+                )
+                raise gr.Error(
+                    f"{stage.replace('_', ' ').capitalize()} failed "
+                    f"(operation {operation_id}). Check the server logs."
+                ) from error
+            logger.info(
+                "Inference stage completed",
+                extra={
+                    "event": "inference_stage_completed",
+                    "operation_id": operation_id,
+                    "stage": stage,
+                },
+            )
+            return result
+
+        return wrapped
+
+    return decorator
 
 
 if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
@@ -82,7 +186,7 @@ IS_FLEXICUBES = True if config_name.startswith('instant-mesh') else False
 device = torch.device('cuda')
 
 # load diffusion model
-print('Loading diffusion model ...')
+logger.info("Loading diffusion model", extra={"event": "model_load_started", "stage": "diffusion"})
 pipeline = DiffusionPipeline.from_pretrained(
     "sudo-ai/zero123plus-v1.2", 
     custom_pipeline="zero123plus",
@@ -101,7 +205,7 @@ pipeline.unet.load_state_dict(state_dict, strict=True)
 pipeline = pipeline.to(device0)
 
 # load reconstruction model
-print('Loading reconstruction model ...')
+logger.info("Loading reconstruction model", extra={"event": "model_load_started", "stage": "reconstruction"})
 model_ckpt_path = hf_hub_download(repo_id="TencentARC/InstantMesh", filename="instant_mesh_large.ckpt", repo_type="model", cache_dir=model_cache_dir)
 model = instantiate_from_config(model_config)
 state_dict = torch.load(model_ckpt_path, map_location='cpu')['state_dict']
@@ -113,7 +217,7 @@ if IS_FLEXICUBES:
     model.init_flexicubes_geometry(device1, fovy=30.0)
 model = model.eval()
 
-print('Loading Finished!')
+logger.info("Model loading finished", extra={"event": "model_load_completed", "stage": "startup"})
 
 
 def check_input_image(input_image):
@@ -121,6 +225,7 @@ def check_input_image(input_image):
         raise gr.Error("No image uploaded!")
 
 
+@log_inference_stage("preprocess")
 def preprocess(input_image, do_remove_background):
 
     rembg_session = rembg.new_session() if do_remove_background else None
@@ -131,6 +236,7 @@ def preprocess(input_image, do_remove_background):
     return input_image
 
 
+@log_inference_stage("generate_multi_views")
 def generate_mvs(input_image, sample_steps, sample_seed):
 
     seed_everything(sample_seed)
@@ -178,6 +284,7 @@ def make_mesh(mesh_fpath, planes):
     return mesh_fpath, mesh_glb_fpath
 
 
+@log_inference_stage("make_3d")
 def make3d(images):
 
     images = np.asarray(images, dtype=np.float32) / 255.0
@@ -234,8 +341,6 @@ def make3d(images):
 
     return video_fpath, mesh_fpath, mesh_glb_fpath
 
-
-import gradio as gr
 
 _HEADER_ = '''
 <h2><b>Official 🤗 Gradio Demo</b></h2><h2><a href='https://github.com/TencentARC/InstantMesh' target='_blank'><b>InstantMesh: Efficient 3D Mesh Generation from a Single Image with Sparse-view Large Reconstruction Models</b></a></h2>
