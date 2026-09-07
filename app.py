@@ -128,6 +128,36 @@ def log_inference_stage(stage):
     return decorator
 
 
+def as_gradio_image(image, name):
+    if isinstance(image, Image.Image):
+        return image
+    if isinstance(image, torch.Tensor):
+        image = image.detach().cpu()
+        if image.ndim == 3 and image.shape[0] in (1, 3, 4):
+            image = image.permute(1, 2, 0)
+        image = image.numpy()
+    if isinstance(image, np.ndarray):
+        if image.dtype != np.uint8:
+            image = np.clip(image * 255 if image.max() <= 1 else image, 0, 255).astype(np.uint8)
+        result = Image.fromarray(image)
+        logger.info(
+            "Converted output to Gradio image",
+            extra={"event": "gradio_output_converted", "stage": name},
+        )
+        return result
+    raise TypeError(f"{name} returned unsupported image type: {type(image).__name__}")
+
+
+def validate_output_file(path, name):
+    if not isinstance(path, str) or not os.path.isfile(path):
+        raise FileNotFoundError(f"{name} output was not created: {path}")
+    logger.info(
+        "Gradio file output ready",
+        extra={"event": "gradio_file_output_ready", "stage": name},
+    )
+    return path
+
+
 if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
     device0 = torch.device('cuda:0')
     device1 = torch.device('cuda:1')
@@ -255,7 +285,9 @@ def generate_mvs(input_image, sample_steps, sample_seed):
     show_image = rearrange(show_image, '(n m) h w c -> (n h) (m w) c', n=2, m=3)
     show_image = Image.fromarray(show_image.numpy())
 
-    return z123_image, show_image
+    return as_gradio_image(z123_image, "generated_views"), as_gradio_image(
+        show_image, "multi_view_preview"
+    )
 
 
 def make_mesh(mesh_fpath, planes):
@@ -339,7 +371,11 @@ def make3d(images):
 
     mesh_fpath, mesh_glb_fpath = make_mesh(mesh_fpath, planes)
 
-    return video_fpath, mesh_fpath, mesh_glb_fpath
+    return (
+        validate_output_file(video_fpath, "video"),
+        validate_output_file(mesh_fpath, "obj"),
+        validate_output_file(mesh_glb_fpath, "glb"),
+    )
 
 
 _HEADER_ = '''
